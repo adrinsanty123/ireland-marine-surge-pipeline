@@ -1,0 +1,35 @@
+name: Daily Marine Surge Pipeline
+
+on:
+  schedule:
+    - cron: '55 23 * * *' # Runs automatically every night at 23:55 UTC
+  workflow_dispatch:       # Enables manual test runs anytime from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  fetch-and-store:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily marine telemetry pipeline
+        run: python pipeline.py
+
+      - name: Commit and push daily data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add daily_csv/ marine_pipeline.db
+          git commit -m "chore: daily marine telemetry $(date -u +'%Y-%m-%d')" || exit 0
+          git push
