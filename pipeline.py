@@ -143,11 +143,135 @@ def run_daily_pipeline():
       .drop_duplicates("station_id")
       .iterrows()
   ):
-    best_buoy, best_dist = None, float("inf")
+    best_buoy = None
+    best_dist = float("inf")
     for _, b in buoy_coords.iterrows():
       d = haversine_km(
           st["latitude"], st["longitude"], b["latitude"], b["longitude"]
       )
       if d < best_dist:
-        best_buoy, best_dist = b["station_id"], d
-    nearest_map[st["station_id"]] = (best
+        best_buoy = b["station_id"]
+        best_dist = d
+    nearest_map[st["station_id"]] = (best_buoy, round(best_dist, 1))
+
+  merged["nearest_buoy_id"] = merged["station_id"].map(
+      lambda s: nearest_map.get(s, (None, None))[0]
+  )
+  merged["buoy_distance_km"] = merged["station_id"].map(
+      lambda s: nearest_map.get(s, (None, None))[1]
+  )
+
+  enriched = pd.merge_asof(
+      merged.sort_values("time"),
+      df_buoy[[
+          "station_id",
+          "time",
+          "AtmosphericPressure",
+          "WindSpeed",
+          "WaveHeight",
+          "SeaTemperature",
+      ]].rename(columns={"station_id": "nearest_buoy_id"}),
+      on="time",
+      by="nearest_buoy_id",
+      direction="backward",
+      tolerance=pd.Timedelta("2h"),
+  )
+  enriched["hazard_tier"] = enriched.apply(
+      lambda r: classify_harbour_hazard(
+          r["storm_surge_m"], r["WaveHeight"], r["WindSpeed"]
+      ),
+      axis=1,
+  )
+
+  # 3. Load into Relational SQLite Database
+  conn = sqlite3.connect(DB_PATH)
+  cur = conn.cursor()
+  cur.executescript("""
+        CREATE TABLE IF NOT EXISTS stations (
+            station_id TEXT PRIMARY KEY,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            nearest_buoy_id TEXT,
+            buoy_distance_km REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS buoy_observations (
+            station_id TEXT NOT NULL,
+            timestamp_utc TEXT NOT NULL,
+            atmospheric_pressure_hpa REAL,
+            wind_speed_kn REAL,
+            wave_height_m REAL,
+            wave_period_s REAL,
+            sea_temperature_c REAL,
+            PRIMARY KEY (station_id, timestamp_utc)
+        );
+
+        CREATE TABLE IF NOT EXISTS harbour_telemetry (
+            station_id TEXT NOT NULL,
+            timestamp_utc TEXT NOT NULL,
+            observed_level_m REAL NOT NULL,
+            predicted_level_m REAL,
+            storm_surge_m REAL,
+            rise_rate_m_hr REAL,
+            wave_height_m REAL,
+            wind_speed_kn REAL,
+            hazard_tier TEXT NOT NULL,
+            PRIMARY KEY (station_id, timestamp_utc),
+            FOREIGN KEY (station_id) REFERENCES stations(station_id)
+        );
+    """)
+
+  stations_df = enriched[[
+      "station_id",
+      "latitude",
+      "longitude",
+      "nearest_buoy_id",
+      "buoy_distance_km",
+  ]].drop_duplicates("station_id")
+  cur.executemany(
+      "INSERT OR REPLACE INTO stations VALUES (?, ?, ?, ?, ?)",
+      stations_df.itertuples(index=False, name=None),
+  )
+
+  buoy_load = df_buoy[[
+      "station_id",
+      "time",
+      "AtmosphericPressure",
+      "WindSpeed",
+      "WaveHeight",
+      "WavePeriod",
+      "SeaTemperature",
+  ]].copy()
+  buoy_load["time"] = buoy_load["time"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+  cur.executemany(
+      "INSERT OR REPLACE INTO buoy_observations VALUES (?, ?, ?, ?, ?, ?, ?)",
+      buoy_load.itertuples(index=False, name=None),
+  )
+
+  harbour_load = enriched[[
+      "station_id",
+      "time",
+      "Water_Level_LAT",
+      "predicted_level_m",
+      "storm_surge_m",
+      "rise_rate_m_hr",
+      "WaveHeight",
+      "WindSpeed",
+      "hazard_tier",
+  ]].copy()
+  harbour_load["time"] = harbour_load["time"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+  cur.executemany(
+      "INSERT OR REPLACE INTO harbour_telemetry VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      harbour_load.itertuples(index=False, name=None),
+  )
+
+  conn.commit()
+  conn.close()
+  print(
+      f"[{date_tag}] Saved {len(harbour_load)} coastal rows and"
+      f" {len(buoy_load)} buoy rows to {DB_PATH}"
+  )
+
+
+if __name__ == "__main__":
+  run_daily_pipeline()
